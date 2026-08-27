@@ -1,0 +1,9 @@
+{
+  "name": "boomi-event-streams",
+  "version": "1.5.0",
+  "description": "Boomi Event Streams tooling \u2014 discover topics, subscriptions and tokens; map which processes produce and consume; monitor live health including dead letter queues and stalled subscriptions; migrate configuration between environments; and create, update or delete entities. Triggers on Event Streams, topics, subscriptions, dead letter queues, and environment promotion.",
+  "author": {
+    "name": "Nishit Raghunandan Kirani",
+    "email": "nishit.raghunandankirani@boomi.com"
+  }
+}

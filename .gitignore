@@ -1,0 +1,11 @@
+# Credentials. Never commit these.
+.env
+
+# Component XML cache built by es_topology.py. Account-specific and regenerable.
+.es-cache/
+
+# Migration plans are working files and may name customer environments.
+es-migration-plan.json
+
+__pycache__/
+*.pyc
