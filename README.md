@@ -68,6 +68,15 @@ If an older copy is already installed, **remove it first**. Two registrations of
 same plugin name can leave the new one disabled with no way to enable it, and that
 failure gives no useful message.
 
+**From GitHub** — the repository must be a *marketplace*, which is a different thing
+from a plugin. Cowork looks for `.claude-plugin/marketplace.json`; without it you get
+_"This repository isn't a marketplace."_ This repo is both: `.claude-plugin/` holds
+`plugin.json` (what the plugin is) and `marketplace.json` (what is on offer, with
+`"source": "./"` pointing at the repo root).
+
+Push the whole repo, then add `owner/repo` as a marketplace. A **private** repo needs
+your account authorised for it, or the fetch fails.
+
 **In Claude Code**, from a local copy:
 
 ```
@@ -75,8 +84,7 @@ failure gives no useful message.
 /plugin install boomi-event-streams@boomi-event-streams
 ```
 
-Point it at the folder containing `.claude-plugin/`, not at `skills/`. The folder is
-its own single-plugin marketplace, which is why the two names repeat.
+Point it at the folder containing `.claude-plugin/`, not at `skills/`.
 
 ## Configure
 

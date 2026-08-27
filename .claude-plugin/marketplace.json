@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "boomi-event-streams",
+  "owner": {
+    "name": "Nishit Raghunandan Kirani",
+    "email": "nishit.raghunandankirani@boomi.com"
+  },
+  "metadata": {
+    "description": "Boomi Event Streams tooling for Claude Code — discover, map, monitor, migrate, and administer topics, subscriptions, and tokens"
+  },
+  "plugins": [
+    {
+      "name": "boomi-event-streams",
+      "description": "Discover, inspect, monitor, migrate, and administer Boomi Event Streams. Eight skills covering inventory, cross-environment lookup, process-to-topic topology, live health including dead letter queues, combined reporting, environment promotion, full CRUD, and credential setup.",
+      "category": "development",
+      "source": "./"
+    }
+  ]
+}
