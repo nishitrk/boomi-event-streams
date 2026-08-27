@@ -77,6 +77,15 @@ _"This repository isn't a marketplace."_ This repo is both: `.claude-plugin/` ho
 Push the whole repo, then add `owner/repo` as a marketplace. A **private** repo needs
 your account authorised for it, or the fetch fails.
 
+> **Known Cowork limitation.** Adding this repo as a marketplace in Cowork works — the
+> plugin and its skills appear in the Directory — but **Install** fails with
+> `Failed to fetch content: 403`. The same repo and commit installs cleanly through the
+> Claude Code CLI, so this is Cowork's install path, not the plugin. Tracked upstream as
+> [claude-code#39400](https://github.com/anthropics/claude-code/issues/39400)
+> ("Marketplace plugins fail to load skills in Cowork — zip upload of same plugin works
+> fine"). **In Cowork, use Upload plugin with the `.zip`;** in the CLI, the marketplace
+> route works. Nothing in this repo needs changing for either.
+
 **In Claude Code**, from a local copy:
 
 ```

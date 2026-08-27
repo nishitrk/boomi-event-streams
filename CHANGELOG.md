@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.5.1
+
+- **Documented a Cowork platform limitation, verified on a real machine.** Installing
+  this plugin from its GitHub marketplace fails in Cowork with
+  `Failed to fetch content: 403`, while the identical repo and commit installs cleanly
+  through the Claude Code CLI. The manifests match the documented schema — `source: "./"`
+  is correct for a git-based marketplace, and no tag or release is required. Upstream:
+  claude-code#39400. Use Upload plugin in Cowork; the CLI marketplace route works.
+
 ## 1.5.0
 
 Documentation, and one diagnostic that was quietly useless.
