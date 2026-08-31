@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.6.0
+
+Tabular output everywhere, and deployment status.
+
+- **Every skill now renders markdown tables** through one shared module
+  (`es_table.py`), so a dash means the same thing in every report. `None` and
+  `False` are kept distinct: a PRODUCE operation has no dead-letter setting at
+  all, and printing "No" for it would claim a setting it cannot have.
+- **Four new columns on the topology map** — Transacted, From DL, Deployed and
+  Environment — read from the operation XML and joined against the account's
+  deployment records.
+- **Deployment status queries both of Boomi's deployment models.** `DeployedPackage`
+  (packaged) and the legacy `Deployment` (per-process) are unioned, because an
+  account can use either. This was not theoretical: on the account this was built
+  against, `DeployedPackage` had 14 active rows, none touching Event Streams, while
+  the legacy object showed 21 deployed Event Streams processes. Querying only the
+  newer object reported "0 of 37 deployed" — wrong about every one of them, and
+  "nothing is deployed" is exactly the kind of finding someone acts on.
+- **Operations with no parent process are now rows, not omissions.** They were
+  silently dropped, which hid the case most worth seeing: a configured operation
+  nothing can invoke. Five turned up on the first real scan.
+- **`migrate apply` reads the target back** and reports Created and Verified as
+  separate columns. A create call returning success is not the same as the entity
+  existing afterwards, and when the two disagree the read is the one to believe.
+- A failed deployment or verification query renders as `unknown` / `unchecked`,
+  never as `No` — a tooling failure must not read as a finding about the account.
+
 ## 1.5.1
 
 - **Documented a Cowork platform limitation, verified on a real machine.** Installing

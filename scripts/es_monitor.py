@@ -118,67 +118,131 @@ def analyse(topics: list[dict]) -> list[dict]:
     return findings
 
 
-def render(env_name: str, topics: list[dict], findings: list[dict]) -> str:
-    lines = [f"# Event Streams live health — {env_name}", ""]
+def sub_state(sub: dict) -> str:
+    """One word for what this subscription is doing right now.
 
-    lines += ["## Topics", "",
-              "| Topic | In/s | Out/s | Backlog | Size | Producers | Subs |",
-              "| --- | --- | --- | --- | --- | --- | --- |"]
-    for topic in sorted(topics, key=lambda t: str(t.get("name"))):
-        lines.append(
-            f"| `{topic.get('name')}` | {rate(topic.get('messageRateIn'))} "
-            f"| {rate(topic.get('messageRateOut'))} "
-            f"| {topic.get('backlogCount', '—')} | {size(topic.get('backlogSize'))} "
-            f"| {topic.get('producerCount', '—')} "
-            f"| {topic.get('subscriptionCount', len(topic.get('subscriptions') or []))} |"
-        )
-    lines.append("")
+    Derived from the same three numbers analyse() reads, so the table and the
+    findings can never disagree. `unknown` is kept distinct from `IDLE`: a missing
+    consumer count means the broker did not report one, which is not the same as
+    reporting zero.
+    """
+    consumers = sub.get("activeConsumerCount")
+    backlog = sub.get("backlogCount") or 0
+    if (sub.get("deadLetterBacklogCount") or 0):
+        return "DEAD LETTERS"
+    if consumers is None:
+        return "unknown"
+    if backlog and not consumers:
+        return "STALLED"
+    if backlog:
+        return "BEHIND"
+    if consumers:
+        return "ACTIVE"
+    return "IDLE"
+
+
+def render(env_name: str, topics: list[dict], findings: list[dict]) -> str:
+    import es_table as T
 
     rows = [(str(t.get("name")), s) for t in topics for s in (t.get("subscriptions") or [])]
+    dead = sum((s.get("deadLetterBacklogCount") or 0) for _, s in rows)
+    stalled = sum(1 for _, s in rows if sub_state(s) == "STALLED")
+
+    lines = [f"# Event Streams live health — {env_name}", ""]
+
+    lines += [
+        T.section("Summary", T.table(
+            ["Metric", "Value"],
+            [
+                ["Topics", len(topics)],
+                ["Subscriptions", len(rows)],
+                ["Total backlog", sum((s.get("backlogCount") or 0) for _, s in rows)],
+                ["Dead letter messages", dead],
+                ["Stalled subscriptions", stalled],
+                ["Findings", len(findings)],
+            ],
+        )),
+    ]
+
+    lines += [
+        T.section("Topics", T.table(
+            ["Topic", "In/s", "Out/s", "Backlog", "Size", "Producers", "Subs"],
+            [
+                [
+                    topic.get("name"),
+                    rate(topic.get("messageRateIn")),
+                    rate(topic.get("messageRateOut")),
+                    topic.get("backlogCount"),
+                    size(topic.get("backlogSize")),
+                    topic.get("producerCount"),
+                    topic.get("subscriptionCount",
+                              len(topic.get("subscriptions") or [])),
+                ]
+                for topic in sorted(topics, key=lambda t: str(t.get("name")))
+            ],
+            empty="_No topics in this environment._",
+        ), level=3),
+    ]
+
     if rows:
-        lines += ["## Subscriptions", "",
-                  "| Topic | Subscription | Consumers | Backlog | Retry | Dead letter |",
-                  "| --- | --- | --- | --- | --- | --- |"]
-        for topic_name, sub in sorted(rows, key=lambda r: (r[0], str(r[1].get("name")))):
-            dlq = sub.get("deadLetterBacklogCount") or 0
-            lines.append(
-                f"| `{topic_name}` | `{sub.get('name')}` "
-                f"| {sub.get('activeConsumerCount', '—')} "
-                f"| {sub.get('backlogCount', 0)} "
-                f"| {sub.get('retryBacklogCount', 0) or '—'} "
-                f"| {'**' + str(dlq) + '**' if dlq else '—'} |"
-            )
-        lines.append("")
+        lines += [
+            T.section("Subscriptions", T.table(
+                ["Subscription", "Topic", "Backlog", "Active consumers",
+                 "Retry", "Dead letter", "State"],
+                [
+                    [
+                        sub.get("name"),
+                        topic_name,
+                        sub.get("backlogCount", 0),
+                        sub.get("activeConsumerCount"),
+                        sub.get("retryBacklogCount") or None,
+                        ("**" + str(sub.get("deadLetterBacklogCount")) + "**"
+                         if (sub.get("deadLetterBacklogCount") or 0) else None),
+                        sub_state(sub),
+                    ]
+                    for topic_name, sub in sorted(
+                        rows, key=lambda r: (r[0], str(r[1].get("name")))
+                    )
+                ],
+            ), level=3),
+            "_A backlog with no active consumer is a stopped integration; a backlog "
+            "with one attached is only a slow one. That is the distinction "
+            "`activeConsumerCount` exists to make, and it is why State is worth "
+            "reading before Backlog._",
+            "",
+            f"_An empty Active consumers cell is {T.DASH}, not zero: it means the "
+            "broker did not report a count, which is a tooling gap rather than a "
+            "finding about the subscription._",
+            "",
+        ]
 
     lines += [f"## Findings ({len(findings)})", ""]
     if not findings:
         lines.append("Nothing flowing badly. No dead letters, no stalled subscriptions.")
         return "\n".join(lines)
 
-    for severity in ("high", "medium", "low"):
-        group = [f for f in findings if f["severity"] == severity]
-        if not group:
-            continue
-        lines += [f"### {severity.title()} ({len(group)})", ""]
-        for f in group:
-            lines.append(f"- **`{f['subject']}` — {f['finding']}.** {f['detail']}")
-        lines.append("")
+    lines += [T.severity_summary(findings), "", T.wrap_findings(findings), ""]
     return "\n".join(lines)
 
 
 def render_messages(label: str, messages: list[dict], show_payload: bool) -> str:
+    import es_table as T
+
     if not messages:
         return f"\n_{label}: empty._\n"
-    lines = [f"\n### {label} ({len(messages)})", "",
-             "| Published | Producer | Redeliveries | Size | Message ID |",
-             "| --- | --- | --- | --- | --- |"]
-    for m in messages:
-        lines.append(
-            f"| {m.get('publishTime', '—')} | {m.get('producer') or '—'} "
-            f"| {m.get('redeliveryCount', 0)} | {size(m.get('size'))} "
-            f"| `{str(m.get('messageId'))[:24]}` |"
-        )
-    lines.append("")
+    lines = ["", T.section(f"{label} ({len(messages)})", T.table(
+        ["Published", "Producer", "Redeliveries", "Size", "Message ID"],
+        [
+            [
+                m.get("publishTime"),
+                m.get("producer"),
+                m.get("redeliveryCount", 0),
+                size(m.get("size")),
+                str(m.get("messageId"))[:24],
+            ]
+            for m in messages
+        ],
+    ), level=3)]
     if show_payload:
         for m in messages:
             body = str(m.get("payload") or "")

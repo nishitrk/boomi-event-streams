@@ -1,7 +1,7 @@
 # Command reference
 
 Every command and flag, generated from the CLIs themselves and verified against
-`--help`. Eight skills, 15 scripts, 26 distinct operations.
+`--help`. Eight skills, 16 scripts, 26 distinct operations. All output is tabular.
 
 In Claude you rarely type these — ask in plain language and the right skill loads.
 The reference is for when you want to run something directly, or check what a skill

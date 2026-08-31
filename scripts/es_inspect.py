@@ -223,6 +223,90 @@ def classify_action(xml: str, name: str = "") -> str:
     return raw.lower() or "unknown"
 
 
+SUB_NAME_PATTERN = re.compile(r'<field[^>]*id="subscription"[^>]*value="([^"]*)"')
+SUB_TYPE_PATTERN = re.compile(r'<field[^>]*id="subscriptionType"[^>]*value="([^"]*)"')
+TRANSACTED_PATTERN = re.compile(r'<field[^>]*id="transacted"[^>]*value="([^"]*)"')
+FROM_DL_PATTERN = re.compile(r'<field[^>]*id="consumeFromDeadLetter"[^>]*value="([^"]*)"')
+
+
+def _field(pattern: "re.Pattern[str]", xml: str) -> str | None:
+    match = pattern.search(xml)
+    value = match.group(1).strip() if match else ""
+    return value or None
+
+
+def _flag(pattern: "re.Pattern[str]", xml: str) -> bool | None:
+    """Tri-state on purpose.
+
+    False means the operation set the flag off; None means the field is absent,
+    which is what a PRODUCE operation looks like. Collapsing the two would print
+    "No" against producers for a setting they cannot have.
+    """
+    value = _field(pattern, xml)
+    if value is None:
+        return None
+    return value.lower() == "true"
+
+
+def subscription_of(xml: str) -> tuple[str | None, str | None]:
+    """(subscription name, subscription type) as the operation declares them.
+
+    This is the operation's view, not the broker's. `es_discover` reports the
+    broker's type, which stays NONE until a consumer attaches -- so the two
+    legitimately disagree, and that gap is the point: it shows what a process
+    intends versus what has actually connected.
+    """
+    return _field(SUB_NAME_PATTERN, xml), _field(SUB_TYPE_PATTERN, xml)
+
+
+def deployment_index(client: BoomiClient) -> dict[str, list[str]]:
+    """{componentId -> [environmentId]} for everything currently deployed.
+
+    Boomi has **two** deployment models and an account can use either, so both are
+    queried and unioned:
+
+      - `DeployedPackage` (packaged deployment), rows where `active` is true
+      - `Deployment` (legacy per-process deployment), rows where `current` is true
+
+    Querying only one is a confident false negative, and this was not theoretical:
+    on the account this was written against, `DeployedPackage` had 14 active rows,
+    none of which touched Event Streams, while the legacy `Deployment` object
+    showed 21 deployed Event Streams processes. Reporting "0 deployed" there would
+    have been wrong about every one of them -- and "nothing is deployed" is exactly
+    the kind of finding someone acts on.
+
+    Both objects also carry historical rows (535 and 507 respectively on that
+    account), so the active/current filters are what separate live from replaced.
+    """
+    index: dict[str, list[str]] = {}
+
+    def record(component: Any, environment: Any) -> None:
+        component, environment = str(component or ""), str(environment or "")
+        if not component or not environment:
+            return
+        if environment not in index.setdefault(component, []):
+            index[component].append(environment)
+
+    try:
+        for row in client.rest_query_all("DeployedPackage"):
+            if row.get("active"):
+                record(row.get("componentId"), row.get("environmentId"))
+    except BoomiAPIError:
+        pass
+
+    try:
+        for row in client.rest_query_all("Deployment"):
+            if row.get("current"):
+                # Legacy rows carry both; processId is the one that matches a process
+                # component, and componentId can point at a subordinate part.
+                record(row.get("processId"), row.get("environmentId"))
+                record(row.get("componentId"), row.get("environmentId"))
+    except BoomiAPIError:
+        pass
+
+    return index
+
+
 def access_mode(xml: str) -> str | None:
     """Exclusive / Shared / Failover, as configured on the operation."""
     match = ACCESS_MODE_PATTERN.search(xml)
@@ -360,6 +444,10 @@ def find_operations(
                     "confidence": confidence,
                     "action": classify_action(xml, str(meta.get("name", ""))),
                     "accessMode": access_mode(xml),
+                    "subscription": subscription_of(xml)[0],
+                    "subscriptionType": subscription_of(xml)[1],
+                    "transacted": _flag(TRANSACTED_PATTERN, xml),
+                    "fromDeadLetter": _flag(FROM_DL_PATTERN, xml),
                     "hinted": is_hinted(meta),
                 }
             )
@@ -564,16 +652,7 @@ def _map_via_references(
                     continue
                 seen_parents.add(parent)
                 if parent in names:
-                    usages.append(
-                        {
-                            "processName": names[parent],
-                            "processId": parent,
-                            "operationName": operation["name"],
-                            "topic": operation["topic"],
-                            "action": operation["action"],
-                            "confidence": operation["confidence"],
-                        }
-                    )
+                    usages.append(_usage(operation, names[parent], parent))
                     continue
                 # Not a process -- it may itself be referenced by one.
                 if depth < MAX_REFERENCE_DEPTH:
@@ -601,6 +680,30 @@ def _map_via_references(
     return usages
 
 
+def _usage(operation: dict, process_name: str | None, process_id: str | None) -> dict:
+    """One row of the topology map.
+
+    `processName` of None is a real, reportable state -- an operation no process
+    references. Those used to be dropped silently, which hid exactly the case
+    worth surfacing: a configured operation nothing can ever invoke.
+    """
+    return {
+        "processName": process_name,
+        "processId": process_id,
+        "operationName": operation["name"],
+        "operationId": operation.get("componentId"),
+        "topic": operation["topic"],
+        "action": operation["action"],
+        "confidence": operation["confidence"],
+        "subscription": operation.get("subscription"),
+        "subscriptionType": operation.get("subscriptionType"),
+        "transacted": operation.get("transacted"),
+        "fromDeadLetter": operation.get("fromDeadLetter"),
+        "deployed": False,
+        "environments": [],
+    }
+
+
 def map_processes(
     client: BoomiClient,
     operations: list[dict],
@@ -616,6 +719,8 @@ def map_processes(
     if use_reference_api:
         via_references = _map_via_references(client, by_id, verbose, debug)
         if via_references is not None:
+            _add_orphans(via_references, by_id)
+            _attach_deployment(client, via_references, verbose)
             return via_references
         if verbose:
             print(
@@ -641,17 +746,54 @@ def map_processes(
             operation = by_id.get(referenced)
             if not operation:
                 continue
-            usages.append(
-                {
-                    "processName": meta.get("name"),
-                    "processId": component_id,
-                    "operationName": operation["name"],
-                    "topic": operation["topic"],
-                    "action": operation["action"],
-                    "confidence": operation["confidence"],
-                }
-            )
+            usages.append(_usage(operation, meta.get("name"), component_id))
+    _add_orphans(usages, by_id)
+    _attach_deployment(client, usages, verbose)
     return usages
+
+
+def _add_orphans(usages: list[dict], by_id: dict[str, dict]) -> None:
+    """Add a row for every operation no process references."""
+    referenced = {u.get("operationId") for u in usages}
+    for component_id, operation in by_id.items():
+        if component_id not in referenced:
+            usages.append(_usage(operation, None, None))
+
+
+def _attach_deployment(client: BoomiClient, usages: list[dict], verbose: bool) -> None:
+    """Mark which usages are live, and where.
+
+    Deployment is a property of the *process*, not the operation, so an operation
+    is live exactly when a process referencing it is deployed. An orphaned
+    operation is therefore never deployed, which is the honest answer.
+    """
+    try:
+        index = deployment_index(client)
+    except Exception as exc:                       # noqa: BLE001
+        if verbose:
+            print(f"  deployment status unavailable ({exc}); "
+                  f"reporting operations without it", file=sys.stderr)
+        for usage in usages:
+            usage["deployed"] = None
+        return
+
+    names = environment_names(client)
+    for usage in usages:
+        environments = index.get(str(usage.get("processId") or ""), [])
+        usage["deployed"] = bool(environments)
+        usage["environments"] = [names.get(e, e) for e in environments]
+
+
+def environment_names(client: BoomiClient) -> dict[str, str]:
+    """{environmentId -> name}. Falls back to ids if the query is unavailable."""
+    try:
+        return {
+            str(row.get("id")): str(row.get("name"))
+            for row in client.rest_query_all("Environment")
+            if row.get("id")
+        }
+    except Exception:                              # noqa: BLE001
+        return {}
 
 
 def analyse(topics: list[dict], usages: list[dict], tokens: list[dict] | None = None) -> list[dict]:

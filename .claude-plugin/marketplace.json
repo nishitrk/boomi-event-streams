@@ -10,7 +10,7 @@
   "plugins": [
     {
       "name": "boomi-event-streams",
-      "description": "Discover, inspect, monitor, migrate, and administer Boomi Event Streams. Eight skills covering inventory, cross-environment lookup, process-to-topic topology, live health including dead letter queues, combined reporting, environment promotion, full CRUD, and credential setup.",
+      "description": "Discover, inspect, monitor, migrate and administer Boomi Event Streams. Eight skills with tabular output covering inventory, cross-environment lookup, process-to-topic topology with deployment status, live health including dead letter queues, combined reporting, environment promotion, full CRUD, and credential setup.",
       "category": "development",
       "source": "./"
     }

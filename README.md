@@ -4,7 +4,7 @@ Discover, inspect, monitor, migrate, and administer Boomi Event Streams from Cla
 Code — or from the command line, if you prefer.
 
 Eight skills, no dependencies beyond Python 3.9, and nothing deployed into your Boomi
-account.
+account. Every skill answers in tables.
 
 **New here? Read [`SETUP.md`](SETUP.md) first** — it is four steps, and step 3 catches
 everyone.
@@ -232,6 +232,30 @@ The honest limit: a user can edit their own `.env` and unprotect an environment.
 is weaker than a platform-enforced guardrail, and is stated here rather than glossed
 over.
 
+## What the topology map reports
+
+Eight columns per operation: Subscription, Type, Operation, Process, Transacted,
+From DL, Deployed and Environment.
+
+`Type` and `Subscription` are what the **operation declares**. `es-discover` reports
+what the **broker** has, which stays `NONE` until a consumer attaches. The two
+disagreeing is normal, and the gap is the useful part: it separates what a process
+intends from what has actually connected.
+
+**Deployment status is read from both of Boomi's deployment models.** `DeployedPackage`
+(packaged) and the legacy `Deployment` (per-process) are unioned, because an account can
+use either and querying one alone is a confident false negative. On the account this was
+built against, `DeployedPackage` had 14 active rows, none of them touching Event Streams,
+while the legacy object showed 21 deployed Event Streams processes — so the packaged
+query alone would have reported nothing deployed, and been wrong about every one.
+
+**Operations with no parent process appear as rows**, marked `⚠️ no parent process`,
+rather than being omitted. A configured operation that nothing can invoke is the case
+most worth seeing, and dropping those rows hid it.
+
+A failed deployment query renders as `unknown`, never as `No`. A tooling failure must
+not read as a finding about your account.
+
 ## Behaviours that look like bugs and are not
 
 **Subscription type shows `NONE`.** The broker assigns type when a consumer attaches;
@@ -342,6 +366,7 @@ boomi-event-streams/
 │   ├── es_migrate.py            migration CLI
 │   ├── es_admin.py              create / update / delete CLI
 │   ├── es_schema.py             what this account's schema supports
+│   ├── es_table.py              one markdown table renderer, shared by every skill
 │   ├── test_offline.py          unit tests
 │   └── test_integration.py      end-to-end tests against a mocked account
 ├── reference/

@@ -75,29 +75,64 @@ def resolve_environment(es: EventStreamsClient, wanted: str | None) -> str | Non
 
 
 def render(inventory: dict) -> str:
+    import es_table as T
+
+    environments = inventory["environments"]
     lines: list[str] = ["# Event Streams inventory", ""]
 
     # Surfaced at the top rather than in a footnote: if the list is incomplete,
     # everything below it is suspect and the reader needs to know before reading it.
     all_warnings = [
-        w for env in inventory["environments"] for w in env.get("completenessWarnings") or []
+        w for env in environments for w in env.get("completenessWarnings") or []
     ]
     if all_warnings:
         lines.append("> **This inventory may be incomplete.**")
         lines += [f"> - {w}" for w in all_warnings]
         lines.append("")
 
-    for env in inventory["environments"]:
+    def sub_count(env: dict) -> int:
+        return sum(len(t.get("subscriptions") or []) for t in env.get("topics") or [])
+
+    summary_rows = []
+    for env in environments:
+        if not env["eventStreamsProvisioned"]:
+            # None, not 0: there is no Event Streams here to count, which is a
+            # different statement from "there is one and it is empty".
+            summary_rows.append([env["name"], None, None, None])
+        else:
+            summary_rows.append([
+                env["name"],
+                len(env.get("topics") or []),
+                sub_count(env),
+                len(env.get("tokens") or []),
+            ])
+
+    lines += [
+        T.section("Summary", T.table(
+            ["Environment", "Topics", "Subscriptions", "Tokens"], summary_rows,
+        )),
+        f"_{T.DASH} means Event Streams is not provisioned in that environment, "
+        "which is a different thing from an empty one. That absence is usually the "
+        "answer to \"why can't I see my topics\", so unprovisioned environments are "
+        "listed rather than hidden._",
+        "",
+    ]
+
+    for env in environments:
         lines.append(f"## {env['name']}")
         lines.append("")
-        lines.append(f"- Environment ID: `{env['id']}`")
 
         if not env["eventStreamsProvisioned"]:
-            lines.append("- **Event Streams is not provisioned in this environment.**")
+            lines.append(f"_Environment ID `{env['id']}`._")
+            lines.append("")
+            lines.append("**Event Streams is not provisioned in this environment.**")
             lines.append("")
             continue
 
-        lines.append(f"- Region: {env.get('region') or 'unknown'}")
+        lines.append(
+            f"_Environment ID `{env['id']}` {T.DASH} region "
+            f"{env.get('region') or 'unknown'}._"
+        )
         lines.append("")
 
         topics = env.get("topics") or []
@@ -109,59 +144,55 @@ def render(inventory: dict) -> str:
             # rather than as inapplicable.
             present = {key for topic in topics for key in topic if key != "subscriptions"}
             optional_columns = [
-                ("persistent", "Persistent", lambda t: "yes" if t.get("persistent") else "no"),
-                ("partitions", "Partitions", lambda t: str(t.get("partitions", "—"))),
-                ("description", "Description", lambda t: str(t.get("description") or "—")),
+                ("persistent", "Persistent", lambda t: T.yes_no(t.get("persistent"))),
+                ("partitions", "Partitions", lambda t: t.get("partitions")),
+                ("description", "Description", lambda t: t.get("description")),
             ]
             active = [c for c in optional_columns if c[0] in present]
 
-            header = ["Topic"] + [label for _, label, _ in active] + ["Subscriptions"]
-            lines.append(f"### Topics ({len(topics)})")
-            lines.append("")
-            lines.append("| " + " | ".join(header) + " |")
-            lines.append("| " + " | ".join(["---"] * len(header)) + " |")
+            rows = []
             for topic in sorted(topics, key=lambda t: str(t.get("name", ""))):
-                subs = topic.get("subscriptions") or []
-                sub_names = ", ".join(str(s.get("name")) for s in subs) or "—"
-                row = (
-                    [f"`{topic.get('name')}`"]
-                    + [render_cell(topic) for _, _, render_cell in active]
-                    + [sub_names]
+                extra = [render_cell(topic) for _, _, render_cell in active]
+                subs = sorted(
+                    topic.get("subscriptions") or [],
+                    key=lambda s: str(s.get("name", "")),
                 )
-                lines.append("| " + " | ".join(row) + " |")
-            lines.append("")
+                if not subs:
+                    # A topic with no subscription has no subscription type and no
+                    # durability, so those cells are absent rather than false.
+                    rows.append([topic.get("name"), None, None, None, None, *extra])
+                    continue
+                for sub in subs:
+                    rows.append([
+                        topic.get("name"),
+                        sub.get("name"),
+                        sub.get("type") or "NONE",
+                        T.yes_no(sub.get("durable")),
+                        sub.get("backlogCount", 0),
+                        *extra,
+                    ])
 
-            subscription_rows = [
-                (topic.get("name"), sub)
-                for topic in topics
-                for sub in (topic.get("subscriptions") or [])
+            header = (["Topic", "Subscription", "Type", "Durable", "Backlog"]
+                      + [label for _, label, _ in active])
+            lines += [
+                T.section(
+                    f"Topics and subscriptions "
+                    f"({len(topics)} topic(s), {sub_count(env)} subscription(s))",
+                    T.table(header, rows, empty="_No topics._"),
+                    level=3,
+                ),
+                "_Type `NONE` is what the broker reports until a consumer attaches; "
+                "it assigns EXCLUSIVE / SHARED / FAILOVER / KEY_SHARED at that point. "
+                "It is not a misconfiguration._",
+                "",
             ]
-            if subscription_rows:
-                lines.append(f"### Subscriptions ({len(subscription_rows)})")
-                lines.append("")
-                lines.append("| Topic | Subscription | Type | Durable | Backlog |")
-                lines.append("| --- | --- | --- | --- | --- |")
-                for topic_name, sub in sorted(
-                    subscription_rows, key=lambda r: (str(r[0]), str(r[1].get("name")))
-                ):
-                    lines.append(
-                        f"| `{topic_name}` "
-                        f"| `{sub.get('name')}` "
-                        f"| {sub.get('type') or 'NONE'} "
-                        f"| {'yes' if sub.get('durable') else 'no'} "
-                        f"| {sub.get('backlogCount', 0)} |"
-                    )
-                lines.append("")
         else:
             lines.append("_No topics._")
             lines.append("")
 
         tokens = env.get("tokens") or []
         if tokens:
-            lines.append(f"### Tokens ({len(tokens)})")
-            lines.append("")
-            lines.append("| Token | Produce | Consume | Expires |")
-            lines.append("| --- | --- | --- | --- |")
+            rows = []
             expired: list[str] = []
             expiring: list[str] = []
             for token in sorted(tokens, key=lambda t: str(t.get("name", ""))):
@@ -171,13 +202,25 @@ def render(inventory: dict) -> str:
                     expired.append(name)
                 elif state == "expiring":
                     expiring.append(name)
-                lines.append(
-                    f"| `{name}` "
-                    f"| {'yes' if token.get('allowProduce') else 'no'} "
-                    f"| {'yes' if token.get('allowConsume') else 'no'} "
-                    f"| {label} |"
-                )
-            lines.append("")
+                rows.append([
+                    name,
+                    T.yes_no(token.get("allowConsume")),
+                    T.yes_no(token.get("allowProduce")),
+                    label,
+                    token.get("description"),
+                ])
+
+            lines += [
+                T.section(
+                    f"Tokens ({len(tokens)})",
+                    T.numbered(
+                        ["Name", "Consume", "Produce", "Expires", "Description"],
+                        rows,
+                        empty="_No tokens._",
+                    ),
+                    level=3,
+                ),
+            ]
 
             if expired:
                 lines.append(

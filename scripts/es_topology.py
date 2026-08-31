@@ -37,29 +37,71 @@ def render(
     census: dict[str, int] | None,
     diagnose: bool,
 ) -> str:
+    import es_table as T
+
     lines = [f"# Event Streams topology — {env_name}", ""]
 
     if usages:
+        deployed = [u for u in usages if u.get("deployed")]
+        orphaned = [u for u in usages if not u.get("processName")]
         lines += [
-            "## Topic to process map",
-            "",
-            "| Topic | Action | Process | Operation | Match |",
-            "| --- | --- | --- | --- | --- |",
+            T.section("Summary", T.table(
+                ["Metric", "Value"],
+                [
+                    ["Topics referenced", len({u.get("topic") for u in usages if u.get("topic")})],
+                    ["Operations", len(usages)],
+                    ["Deployed", f"{len(deployed)} of {len(usages)}"],
+                    ["Orphaned operations", len(orphaned)],
+                ],
+            )),
+            T.section("Operations by action",
+                      T.counts("Action", T.summarise(usages, "action"))),
         ]
-        for usage in sorted(usages, key=lambda u: (str(u.get("topic")), str(u["processName"]))):
-            lines.append(
-                f"| `{usage.get('topic') or '?'}` | {usage['action']} "
-                f"| {usage['processName']} | {usage['operationName']} "
-                f"| {usage.get('confidence', '?')} |"
-            )
+
+        # Grouped by topic, because the question people arrive with is almost always
+        # "what touches this topic", not "what does this process do".
+        by_topic: dict[str, list[dict]] = {}
+        for usage in usages:
+            by_topic.setdefault(str(usage.get("topic") or "(dynamic)"), []).append(usage)
+
+        lines += ["## Topic to process map", ""]
+        for topic in sorted(by_topic):
+            rows = sorted(by_topic[topic], key=lambda u: (u["action"], str(u.get("processName"))))
+            live = sum(1 for r in rows if r.get("deployed"))
+            state = ("DEPLOYED" if live == len(rows)
+                     else "NOT DEPLOYED" if live == 0 else "PARTIALLY DEPLOYED")
+            body = []
+            for r in rows:
+                dep, envs = T.status(r.get("deployed"), r.get("environments"))
+                body.append([
+                    r.get("subscription"),
+                    r.get("subscriptionType"),
+                    r["action"],
+                    r.get("processName") or "⚠️ no parent process",
+                    T.yes_no(r.get("transacted")),
+                    T.yes_no(r.get("fromDeadLetter")),
+                    dep,
+                    envs,
+                ])
+            lines += [
+                f"### `{topic}` — {state}",
+                "",
+                T.table(
+                    ["Subscription", "Type", "Operation", "Process",
+                     "Transacted", "From DL", "Deployed", "Environment"],
+                    body,
+                ),
+                "",
+            ]
+
         lines += [
+            "_Type and Subscription are what the **operation declares**; "
+            "`es_discover` reports what the **broker** has, which stays `NONE` until a "
+            "consumer attaches. The two disagreeing is normal, and the gap is "
+            "informative: it separates intent from what has actually connected._",
             "",
-            "_Match column: `exact` — the operation declares this topic and it exists "
-            "here. `declared` — the operation declares a topic that does **not** exist "
-            "in this environment, which is an orphaned operation. `dynamic` — the topic "
-            "is resolved at runtime, so the value shown is an expression, not a topic "
-            "name. `pattern` / `by-connector` — inferred rather than declared; treat "
-            "with suspicion._",
+            "_Deployed is a property of the process, not the operation. An operation "
+            "with no parent process can never be deployed._",
             "",
         ]
     else:
@@ -70,7 +112,8 @@ def render(
             "",
             "Either no process in this account uses Event Streams, the scan was "
             "limited or skipped, or the operations were not recognised. Run with "
-            "`--diagnose` to see which connector types this account actually has.",
+            "`--diagnose --skip-processes` to see which connector types this account "
+            "actually has.",
             "",
         ]
 
@@ -83,19 +126,14 @@ def render(
             "_Complete — this census covers every connector operation in the account, "
             "not just the ones read during the scan._",
             "",
-            "| subType | Operations |",
-            "| --- | --- |",
+            T.table(["subType", "Operations"],
+                    sorted(census.items(), key=lambda kv: -kv[1])),
+            "",
         ]
-        for sub_type, count in sorted(census.items(), key=lambda kv: -kv[1]):
-            lines.append(f"| `{sub_type}` | {count} |")
-        lines.append("")
 
         from es_inspect import connector_hints
 
-        looks_like_es = [
-            s for s in census
-            if any(h in s.lower() for h in connector_hints())
-        ]
+        looks_like_es = [s for s in census if any(h in s.lower() for h in connector_hints())]
         if looks_like_es:
             lines += [
                 "Connector type(s) that look like Event Streams: "
@@ -114,21 +152,14 @@ def render(
                 "",
             ]
 
-    lines += [f"## Health findings ({len(findings)})", ""]
-    if not findings:
-        lines.append("No issues found.")
-        return "\n".join(lines)
-
-    for severity in ("high", "medium", "low"):
-        group = [f for f in findings if f["severity"] == severity]
-        if not group:
-            continue
-        lines += [f"### {severity.title()} ({len(group)})", ""]
-        for finding in group:
-            lines.append(
-                f"- **`{finding['subject']}` — {finding['finding']}.** {finding['detail']}"
-            )
-        lines.append("")
+    lines += [
+        f"## Health findings ({len(findings)})",
+        "",
+        T.severity_summary(findings) if findings else "No issues found.",
+        "",
+    ]
+    if findings:
+        lines += [T.wrap_findings(findings), ""]
 
     return "\n".join(lines)
 

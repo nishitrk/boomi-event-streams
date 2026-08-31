@@ -213,44 +213,72 @@ def build_plan(
     }
 
 
+def plan_rows(plan: dict[str, Any]) -> list[list[Any]]:
+    """One row per planned item: creates first, then what is already there.
+
+    Detail carries the per-kind fields that do not deserve their own column —
+    a topic's persistence and partition count, a token's permissions, and the
+    reason a skipped item was skipped.
+    """
+    import es_table as T
+
+    rows: list[list[Any]] = []
+    for topic in plan["topics"]:
+        rows.append([
+            "topic", topic["name"], None, "create",
+            f"persistent: {T.yes_no(topic.get('persistent'))}, partitions: "
+            + (str(topic["partitions"]) if topic.get("partitions") is not None
+               else "default"),
+        ])
+    for sub in plan["subscriptions"]:
+        rows.append(["subscription", sub["name"], sub["topicName"], "create", None])
+    for token in plan["tokens"]:
+        rows.append([
+            "token", token["name"], None, "create",
+            f"produce: {T.yes_no(token['allowProduce'])}, "
+            f"consume: {T.yes_no(token['allowConsume'])}",
+        ])
+    for item in plan["skipped"]:
+        name = str(item["name"])
+        parent = None
+        if item["kind"] == "subscription" and "/" in name:
+            parent, name = name.split("/", 1)
+        rows.append([item["kind"], name, parent, "skip", item["reason"]])
+    return rows
+
+
 def render_plan(plan: dict[str, Any]) -> str:
+    import es_table as T
+
+    to_create = len(plan["topics"]) + len(plan["subscriptions"]) + len(plan["tokens"])
     lines = [
         f"# Migration plan — {plan['source']['name']} → {plan['target']['name']}",
         "",
+        T.section("Summary", T.table(
+            ["Metric", "Value"],
+            [
+                ["Topics to create", len(plan["topics"])],
+                ["Subscriptions to create", len(plan["subscriptions"])],
+                ["Tokens to create", len(plan["tokens"])],
+                ["Already present, skipped", len(plan["skipped"])],
+                ["Total to create", to_create],
+            ],
+        )),
+        T.section(
+            "Plan",
+            T.numbered(
+                ["Type", "Name", "Parent topic", "Action", "Detail"],
+                plan_rows(plan),
+                empty="_Nothing to create._",
+            ),
+        ),
+        "_Action `skip` means the item already exists in the target and will not be "
+        "touched. Nothing in this script deletes or overwrites._",
+        "",
+        f"_Parent topic is {T.DASH} for topics and tokens, which have none — it is "
+        "not a missing value._",
+        "",
     ]
-
-    def section(title: str, rows: list[str]) -> None:
-        lines.append(f"## {title} ({len(rows)})")
-        lines.append("")
-        lines.extend(rows or ["_Nothing to create._"])
-        lines.append("")
-
-    section(
-        "Topics to create",
-        [
-            f"- `{t['name']}` — persistent: {t.get('persistent')}, "
-            f"partitions: {t.get('partitions') if t.get('partitions') is not None else 'default'}"
-            for t in plan["topics"]
-        ],
-    )
-    section(
-        "Subscriptions to create",
-        [f"- `{s['topicName']}` / `{s['name']}`" for s in plan["subscriptions"]],
-    )
-    section(
-        "Tokens to create",
-        [
-            f"- `{t['name']}` — produce: {t['allowProduce']}, consume: {t['allowConsume']}"
-            for t in plan["tokens"]
-        ],
-    )
-
-    if plan["skipped"]:
-        lines.append(f"## Already present, will be skipped ({len(plan['skipped'])})")
-        lines.append("")
-        for item in plan["skipped"]:
-            lines.append(f"- {item['kind']}: `{item['name']}` — {item['reason']}")
-        lines.append("")
 
     if plan["subscriptions"]:
         lines += [
@@ -318,6 +346,8 @@ def cmd_plan(args: argparse.Namespace, es: EventStreamsClient | None = None) -> 
 
 
 def cmd_apply(args: argparse.Namespace, es: EventStreamsClient | None = None) -> int:
+    import es_table as T
+
     with open(args.plan, "r", encoding="utf-8") as handle:
         plan = json.load(handle)
 
@@ -336,6 +366,11 @@ def cmd_apply(args: argparse.Namespace, es: EventStreamsClient | None = None) ->
 
     created: list[str] = []
     failed: list[str] = []
+    # Rows for the summary table. Held alongside created/failed rather than derived
+    # from them: those two carry free text, and re-parsing a sentence back into
+    # columns is exactly the kind of step that quietly mangles a name with a slash
+    # in it.
+    results: list[list[Any]] = []
 
     for topic in plan["topics"]:
         try:
@@ -347,9 +382,11 @@ def cmd_apply(args: argparse.Namespace, es: EventStreamsClient | None = None) ->
                 description=topic.get("description"),
             )
             created.append(f"topic {topic['name']}")
+            results.append(["topic", topic["name"], None, "created", None])
             print(f"  created topic {topic['name']}")
         except (BoomiAPIError, BoomiAuthError) as exc:
             failed.append(f"topic {topic['name']}: {exc}")
+            results.append(["topic", topic["name"], None, "FAILED", str(exc)])
             print(f"  FAILED topic {topic['name']}: {exc}", file=sys.stderr)
 
     # Subscriptions are created after topics because a subscription cannot exist
@@ -364,9 +401,15 @@ def cmd_apply(args: argparse.Namespace, es: EventStreamsClient | None = None) ->
                 description=sub.get("description"),
             )
             created.append(f"subscription {sub['topicName']}/{sub['name']}")
+            results.append(
+                ["subscription", sub["name"], sub["topicName"], "created", None]
+            )
             print(f"  created subscription {sub['topicName']}/{sub['name']}")
         except (BoomiAPIError, BoomiAuthError) as exc:
             failed.append(f"subscription {sub['topicName']}/{sub['name']}: {exc}")
+            results.append(
+                ["subscription", sub["name"], sub["topicName"], "FAILED", str(exc)]
+            )
             print(f"  FAILED subscription {sub['topicName']}/{sub['name']}: {exc}", file=sys.stderr)
 
     for token in plan["tokens"]:
@@ -380,11 +423,52 @@ def cmd_apply(args: argparse.Namespace, es: EventStreamsClient | None = None) ->
                 description=token.get("description"),
             )
             created.append(f"token {token['name']}")
+            results.append(["token", token["name"], None, "created", None])
             print(f"  created token {token['name']}")
         except (BoomiAPIError, BoomiAuthError) as exc:
             failed.append(f"token {token['name']}: {exc}")
+            results.append(["token", token["name"], None, "FAILED", str(exc)])
             print(f"  FAILED token {token['name']}: {exc}", file=sys.stderr)
 
+    # Read the target back. A create call returning 200 is not the same as the
+    # entity existing afterwards -- on a real migration a token reported created
+    # and then could not be found in the target, and nothing in the apply output
+    # said so. Confirming here means the run reports what is true, not what was
+    # requested.
+    present = _read_back(es, target["id"])
+    for row in results:
+        kind, name, parent = row[0], row[1], row[2]
+        if row[3] == "FAILED":
+            row.insert(4, "—")
+            continue
+        key = (kind, f"{parent}/{name}" if kind == "subscription" else name)
+        if present is None:
+            row.insert(4, "unchecked")
+        elif key in present:
+            row.insert(4, "found")
+        else:
+            row.insert(4, "NOT FOUND")
+            if row[3] == "created":
+                row[3] = "created"
+                failed.append(
+                    f"{kind} {name}: create reported success but it is not in "
+                    f"{target['name']}"
+                )
+
+    print()
+    print(T.section(
+        f"Applied — {plan['source']['name']} → {target['name']}",
+        T.numbered(
+            ["Type", "Name", "Parent topic", "Created", "Verified", "Detail"],
+            results,
+            empty="_The plan contained nothing to create._",
+        ),
+    ))
+    print(
+        "_Created is the result of the create call. Verified is a fresh read of the "
+        "target afterwards — the two can disagree, and when they do the read is the "
+        "one to believe._"
+    )
     print(f"\nCreated {len(created)} item(s); {len(failed)} failed.")
     if plan["tokens"] and not failed:
         print(
@@ -398,7 +482,26 @@ def cmd_apply(args: argparse.Namespace, es: EventStreamsClient | None = None) ->
     return 1 if failed else 0
 
 
+def _read_back(es: EventStreamsClient, environment_id: str) -> set | None:
+    """What the target actually holds now, as {(kind, name)}.
+
+    Returns None if the read itself fails, which renders as "unchecked" rather
+    than "NOT FOUND" -- a failed verification query is not evidence of a missing
+    entity, and reporting it as one would send someone hunting a phantom.
+    """
+    try:
+        found = {("topic", str(t.get("name"))) for t in es.topics(environment_id)}
+        for sub in es.subscriptions(environment_id):
+            found.add(("subscription", f"{sub.get('topicName')}/{sub.get('name')}"))
+        found |= {("token", str(t.get("name"))) for t in es.tokens(environment_id)}
+        return found
+    except (BoomiAPIError, BoomiAuthError):
+        return None
+
+
 def cmd_verify(args: argparse.Namespace, es: EventStreamsClient | None = None) -> int:
+    import es_table as T
+
     es = es or EventStreamsClient(build_client())
     source = resolve(es, args.source)
     target = resolve(es, args.target)
@@ -407,8 +510,11 @@ def cmd_verify(args: argparse.Namespace, es: EventStreamsClient | None = None) -
     target_topics = {str(t.get("name")): t for t in es.topics(target["id"])}
 
     missing_topics = sorted(set(source_topics) - set(target_topics))
-    mismatched: list[str] = []
-    missing_subs: list[str] = []
+    # Held as (topic, field, source value, target value) rather than a formatted
+    # sentence so the table can put each half in its own column. The comparisons
+    # themselves are unchanged, and so is what counts as a difference.
+    mismatched: list[tuple[str, str, Any, Any]] = []
+    missing_subs: list[tuple[str, str]] = []
 
     for name, source_topic in source_topics.items():
         target_topic = target_topics.get(name)
@@ -416,17 +522,17 @@ def cmd_verify(args: argparse.Namespace, es: EventStreamsClient | None = None) -
             continue
         if source_topic.get("partitions") != target_topic.get("partitions"):
             mismatched.append(
-                f"`{name}` partitions: source {source_topic.get('partitions')}, "
-                f"target {target_topic.get('partitions')}"
+                (name, "partitions",
+                 source_topic.get("partitions"), target_topic.get("partitions"))
             )
         if bool(source_topic.get("persistent")) != bool(target_topic.get("persistent")):
             mismatched.append(
-                f"`{name}` persistent: source {source_topic.get('persistent')}, "
-                f"target {target_topic.get('persistent')}"
+                (name, "persistent",
+                 source_topic.get("persistent"), target_topic.get("persistent"))
             )
         source_subs = {str(s.get("name")) for s in source_topic.get("subscriptions") or []}
         target_subs = {str(s.get("name")) for s in target_topic.get("subscriptions") or []}
-        missing_subs.extend(f"`{name}` / `{s}`" for s in sorted(source_subs - target_subs))
+        missing_subs.extend((name, s) for s in sorted(source_subs - target_subs))
 
     # Only claim to have checked what this account's schema actually exposes.
     # Saying "partition counts match" when the field does not exist here would be
@@ -443,22 +549,46 @@ def cmd_verify(args: argparse.Namespace, es: EventStreamsClient | None = None) -
     lines = [f"# Verification — {source['name']} → {target['name']}", ""]
     ok = not (missing_topics or missing_subs or mismatched)
 
+    lines += [
+        T.section("Summary", T.table(
+            ["Metric", "Value"],
+            [
+                ["Topics in source", len(source_topics)],
+                ["Missing topics", len(missing_topics)],
+                ["Missing subscriptions", len(missing_subs)],
+                ["Configuration differences", len(mismatched)],
+                ["Fields compared", ", ".join(compared) if compared else None],
+            ],
+        )),
+    ]
+
     if ok:
         detail = f" with matching {' and '.join(compared)}" if compared else ""
         lines.append(
             f"Every topic and subscription in {source['name']} is present in "
             f"{target['name']}{detail}."
         )
+        lines.append("")
     else:
-        if missing_topics:
-            lines += [f"## Missing topics ({len(missing_topics)})", ""]
-            lines += [f"- `{name}`" for name in missing_topics] + [""]
-        if missing_subs:
-            lines += [f"## Missing subscriptions ({len(missing_subs)})", ""]
-            lines += [f"- {entry}" for entry in missing_subs] + [""]
-        if mismatched:
-            lines += [f"## Configuration differences ({len(mismatched)})", ""]
-            lines += [f"- {entry}" for entry in mismatched] + [""]
+        rows: list[list[Any]] = []
+        for name in missing_topics:
+            rows.append(["topic", name, None,
+                         f"missing from {target['name']}", "present", None])
+        for topic_name, sub_name in missing_subs:
+            rows.append(["subscription", sub_name, topic_name,
+                         f"missing from {target['name']}", "present", None])
+        for topic_name, field, source_value, target_value in mismatched:
+            rows.append(["topic", topic_name, None, f"{field} differs",
+                         source_value, target_value])
+        lines += [
+            T.section("Differences", T.numbered(
+                ["Type", "Name", "Parent topic", "Difference", "Source", "Target"],
+                rows,
+            )),
+            f"_A {T.DASH} in the Target column means the entity is not there at all, "
+            "which is different from it being there with a different setting._",
+            "",
+        ]
 
     lines += [
         "",

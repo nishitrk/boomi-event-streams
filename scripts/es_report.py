@@ -25,6 +25,8 @@ from es_inspect import analyse, find_operations, map_processes
 
 
 def drift_matrix(inventory: dict) -> list[str]:
+    import es_table as T
+
     provisioned = [e for e in inventory["environments"] if e["eventStreamsProvisioned"]]
     if len(provisioned) < 2:
         return ["_Fewer than two provisioned environments; nothing to compare._", ""]
@@ -35,17 +37,22 @@ def drift_matrix(inventory: dict) -> list[str]:
     }
     all_topics = sorted(set().union(*topics_by_env.values())) if topics_by_env else []
 
-    lines = ["| Topic | " + " | ".join(env_names) + " |",
-             "| --- | " + " | ".join(["---"] * len(env_names)) + " |"]
+    rows = []
     incomplete: list[str] = []
     for topic in all_topics:
         present = [topic in topics_by_env[name] for name in env_names]
         if any(present) and not all(present):
             incomplete.append(topic)
-        lines.append(
-            f"| `{topic}` | " + " | ".join("yes" if p else "—" for p in present) + " |"
-        )
-    lines.append("")
+        rows.append([topic, *present])
+
+    lines = [
+        T.table(["Topic", *env_names], rows,
+                empty="_No topics in any provisioned environment._"),
+        "",
+        "_`No` here is a definite absence, not an unknown: every provisioned "
+        "environment was queried._",
+        "",
+    ]
 
     if incomplete:
         lines += [
@@ -65,8 +72,9 @@ def drift_matrix(inventory: dict) -> list[str]:
 
 
 def token_summary(inventory: dict) -> list[str]:
-    lines = ["| Environment | Tokens | Expired | Expiring soon | Duplicate names |",
-             "| --- | --- | --- | --- | --- |"]
+    import es_table as T
+
+    rows = []
     any_problem = False
     for env in inventory["environments"]:
         tokens = env.get("tokens") or []
@@ -79,18 +87,39 @@ def token_summary(inventory: dict) -> list[str]:
         duplicates = len(names) - len(set(names))
         if expired or expiring or duplicates:
             any_problem = True
-        lines.append(
-            f"| {env['name']} | {len(tokens)} | {expired or '—'} "
-            f"| {expiring or '—'} | {duplicates or '—'} |"
-        )
-    lines.append("")
-    if not any_problem:
+        rows.append([env["name"], len(tokens), expired, expiring, duplicates])
+
+    lines = [
+        T.table(
+            ["Environment", "Tokens", "Expired", "Expiring soon", "Duplicate names"],
+            rows,
+            empty="_No tokens in any environment._",
+        ),
+        "",
+    ]
+    if any_problem:
+        expired_names = sorted({
+            str(t.get("name"))
+            for env in inventory["environments"]
+            for t in (env.get("tokens") or [])
+            if expiry_state(t.get("expirationTime"))[0] == "expired"
+        })
+        if expired_names:
+            lines += [
+                "**Expired:** " + ", ".join(f"`{n}`" for n in expired_names)
+                + ". An expired token produces a connection failure rather than a "
+                "warning, so anything still referencing these is already failing.",
+                "",
+            ]
+    else:
         lines += ["No expired tokens, none expiring within 30 days, no duplicate names.", ""]
     return lines
 
 
 def build(es: EventStreamsClient, client, environment: str | None,
           limit: int | None, quiet: bool) -> str:
+    import es_table as T
+
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     inventory = es.inventory()
 
@@ -109,14 +138,43 @@ def build(es: EventStreamsClient, client, environment: str | None,
     )
     token_total = sum(len(e.get("tokens") or []) for e in provisioned)
 
+    # Surfaced above the tables rather than in them: if any environment's list came
+    # back short, every count and every drift row below it is suspect.
+    all_warnings = [
+        w for env in inventory["environments"] for w in env.get("completenessWarnings") or []
+    ]
+    if all_warnings:
+        lines.append("> **This report may be built on an incomplete inventory.**")
+        lines += [f"> - {w}" for w in all_warnings]
+        lines.append("")
+
     lines += [
         "## Summary",
         "",
-        f"- Environments with Event Streams: **{len(provisioned)}**"
-        + (f" (plus {len(not_provisioned)} without)" if not_provisioned else ""),
-        f"- Topics: **{topic_total}**",
-        f"- Subscriptions: **{sub_total}**",
-        f"- Tokens: **{token_total}**",
+        f"Environments with Event Streams: **{len(provisioned)}**"
+        + (f" (plus {len(not_provisioned)} without)" if not_provisioned else "")
+        + ".",
+        "",
+        T.table(
+            ["Environment", "Topics", "Subscriptions", "Tokens"],
+            [
+                [
+                    env["name"],
+                    len(env.get("topics") or []),
+                    sum(len(t.get("subscriptions") or []) for t in env.get("topics") or []),
+                    len(env.get("tokens") or []),
+                ]
+                if env["eventStreamsProvisioned"]
+                # None, not 0: there is no Event Streams here to count, which is a
+                # different statement from "there is one and it is empty".
+                else [env["name"], None, None, None]
+                for env in inventory["environments"]
+            ]
+            + [["**Total**", topic_total, sub_total, token_total]],
+        ),
+        "",
+        f"_{T.DASH} means Event Streams is not provisioned in that environment; the "
+        "total counts only the provisioned ones._",
         "",
     ]
 
@@ -133,20 +191,28 @@ def build(es: EventStreamsClient, client, environment: str | None,
         if not env["eventStreamsProvisioned"]:
             lines += ["_Event Streams is not provisioned here._", ""]
             continue
-        lines.append(f"- Region: {env.get('region') or 'unknown'}")
-        lines.append(f"- Environment ID: `{env['id']}`")
+        lines.append(
+            f"_Environment ID `{env['id']}` {T.DASH} region "
+            f"{env.get('region') or 'unknown'}._"
+        )
         lines.append("")
         topics = env.get("topics") or []
-        if topics:
-            lines += ["| Topic | Subscriptions | Backlog |", "| --- | --- | --- |"]
-            for topic in sorted(topics, key=lambda t: str(t.get("name"))):
-                subs = topic.get("subscriptions") or []
-                backlog = sum(s.get("backlogCount") or 0 for s in subs)
-                names = ", ".join(str(s.get("name")) for s in subs) or "—"
-                lines.append(f"| `{topic.get('name')}` | {names} | {backlog or '—'} |")
-            lines.append("")
-        else:
-            lines += ["_No topics._", ""]
+        lines += [
+            T.table(
+                ["Topic", "Subscriptions", "Backlog"],
+                [
+                    [
+                        topic.get("name"),
+                        [str(s.get("name")) for s in (topic.get("subscriptions") or [])],
+                        sum(s.get("backlogCount") or 0
+                            for s in (topic.get("subscriptions") or [])) or None,
+                    ]
+                    for topic in sorted(topics, key=lambda t: str(t.get("name")))
+                ],
+                empty="_No topics._",
+            ),
+            "",
+        ]
 
     # Topology is scoped to one environment because the scan is expensive and a
     # process-to-topic map is only meaningful against a specific environment's topics.
@@ -168,13 +234,23 @@ def build(es: EventStreamsClient, client, environment: str | None,
 
         lines += [f"## Topology — {env_name}", ""]
         if usages:
-            lines += ["| Topic | Action | Process | Match |", "| --- | --- | --- | --- |"]
-            for u in sorted(usages, key=lambda u: (str(u.get("topic")), str(u["processName"]))):
-                lines.append(
-                    f"| `{u.get('topic')}` | {u['action']} | {u['processName']} "
-                    f"| {u.get('confidence')} |"
-                )
-            lines.append("")
+            lines += [
+                T.table(
+                    ["Topic", "Action", "Process", "Match"],
+                    [
+                        [u.get("topic"), u["action"], u["processName"], u.get("confidence")]
+                        for u in sorted(
+                            usages,
+                            key=lambda u: (str(u.get("topic")), str(u["processName"])),
+                        )
+                    ],
+                ),
+                "",
+                "_Match is how the topic was identified in the operation's XML, not a "
+                "measure of how healthy the link is. Run `es_topology.py` for the "
+                "deployment state and the full per-topic breakdown._",
+                "",
+            ]
         else:
             lines += [
                 "_No process references found._ Run "
@@ -183,8 +259,8 @@ def build(es: EventStreamsClient, client, environment: str | None,
             ]
             if census:
                 lines += [
-                    "Connector types present: "
-                    + ", ".join(f"`{k}` ({v})" for k, v in sorted(census.items(), key=lambda kv: -kv[1])[:10]),
+                    T.counts("Connector type", sorted(
+                        census.items(), key=lambda kv: -kv[1])[:10]),
                     "",
                 ]
 
@@ -203,16 +279,7 @@ def build(es: EventStreamsClient, client, environment: str | None,
         ]
 
     if findings:
-        for severity in ("high", "medium", "low"):
-            group = [f for f in findings if f["severity"] == severity]
-            if not group:
-                continue
-            lines += [f"### {severity.title()} ({len(group)})", ""]
-            for finding in group:
-                lines.append(
-                    f"- **`{finding['subject']}` — {finding['finding']}.** {finding['detail']}"
-                )
-            lines.append("")
+        lines += [T.severity_summary(findings), "", T.wrap_findings(findings), ""]
     else:
         lines += ["No issues found.", ""]
 
